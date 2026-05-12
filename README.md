@@ -66,7 +66,8 @@ bash scripts/run_logit_fusion_gspo.sh
 - `scripts/dapo_baseline_1.5B.sh`
 - `scripts/opd_train.sh`
 
-These scripts are useful references for specific internal experiment settings.
+#### Distributed teacher
+- `scripts/run_logit_fusion_gspo_remote.sh`: deploy student + teacher on seperated GPUs.
 
 ## Acknowledgement
 
