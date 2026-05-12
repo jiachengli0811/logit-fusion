@@ -359,8 +359,18 @@ class GRPOTrainer(BaseTrainer):
         # Model
         if isinstance(model, str):
             model_init_kwargs = args.model_init_kwargs or {}
-            # Special case for DeepSpeed: requires device_map=None ("auto" fails)
-            if args.distributed_state.distributed_type == "DEEPSPEED":
+            # accelerate.prepare() rejects models loaded with device_map='auto'
+            # in any distributed mode (DDP, FSDP, DeepSpeed, etc.). Our default
+            # `create_model_from_path` falls back to device_map='auto', so we
+            # explicitly null it out whenever we're going to be wrapped by a
+            # distributed strategy. The user can still pass an explicit
+            # device_map via `model_init_kwargs` if they really mean to use
+            # accelerate-incompatible placement.
+            is_distributed = (
+                args.distributed_state.distributed_type
+                != args.distributed_state.distributed_type.__class__.NO
+            )
+            if is_distributed and "device_map" not in model_init_kwargs:
                 model_init_kwargs["device_map"] = None
             model = create_model_from_path(model, **model_init_kwargs)
         else:
@@ -536,6 +546,43 @@ class GRPOTrainer(BaseTrainer):
         self.logit_fusion_alpha_schedule = args.logit_fusion_alpha_schedule
         self.logit_fusion_alpha_decay_steps = args.logit_fusion_alpha_decay_steps
         self.use_fusion_importance_sampling = args.use_fusion_importance_sampling
+
+        # Distributed teacher inference: when 'remote', the teacher lives in a
+        # separate process on a dedicated set of GPUs (asymmetric TP) and is
+        # contacted via HTTP by the in-process LogitsProcessor. Wired up below.
+        self.teacher_inference_mode = args.teacher_inference_mode
+        if self.teacher_inference_mode not in {"local", "remote"}:
+            raise ValueError(
+                f"teacher_inference_mode must be 'local' or 'remote', got {self.teacher_inference_mode!r}."
+            )
+        self.teacher_client = None  # populated below in 'remote' mode
+        self._remote_teacher_pad_token_id: int | None = None  # populated below
+
+        teacher_use_remote = self.teacher_inference_mode == "remote"
+        if teacher_use_remote and teacher_model is not None:
+            raise ValueError(
+                "When `teacher_inference_mode='remote'` you must NOT pass `teacher_model` to GRPOTrainer; "
+                "the teacher is served externally by `trl.scripts.teacher_serve`."
+            )
+        if teacher_use_remote:
+            if args.teacher_server_url is None:
+                raise ValueError(
+                    "`teacher_server_url` is required when `teacher_inference_mode='remote'`."
+                )
+            if self.use_vllm:
+                raise ValueError(
+                    "Logit fusion with a remote teacher is not yet supported with vLLM generation. "
+                    "Use `use_vllm=False` (HF `transformers.generate()`) on the student side."
+                )
+            if self.use_transformers_paged:
+                raise ValueError(
+                    "Logit fusion with a remote teacher is not supported when using transformers paged generation."
+                )
+            if self.logit_fusion_alpha is None:
+                self.logit_fusion_alpha = 0.5
+            if not 0.0 <= self.logit_fusion_alpha <= 1.0:
+                raise ValueError("logit_fusion_alpha must be between 0.0 and 1.0 when using a teacher.")
+
         if teacher_model is not None:
             if self.use_vllm:
                 raise ValueError("Logit fusion with a teacher model is not supported when using vLLM generation.")
@@ -619,21 +666,33 @@ class GRPOTrainer(BaseTrainer):
             if teacher_eos is not None:
                 teacher_eos = [teacher_eos] if isinstance(teacher_eos, int) else list(teacher_eos)
                 self.eos_token_ids = list(dict.fromkeys(self.eos_token_ids + teacher_eos))
-        elif self.logit_fusion_alpha is not None:
+        elif self.logit_fusion_alpha is not None and self.teacher_inference_mode != "remote":
             logger.warning(
                 "logit_fusion_alpha is set but no teacher_model was provided. Logit fusion will be disabled."
             )
-        if teacher_model is None and self.logit_fusion_alpha_schedule is not None:
+        if (
+            teacher_model is None
+            and self.logit_fusion_alpha_schedule is not None
+            and self.teacher_inference_mode != "remote"
+        ):
             logger.warning(
                 "logit_fusion_alpha_schedule is set but no teacher_model was provided. Alpha decay will be disabled."
             )
             self.logit_fusion_alpha_schedule = None
         self._logit_fusion_alpha_start = self.logit_fusion_alpha
         if self.use_fusion_importance_sampling and teacher_model is None:
-            logger.warning(
-                "use_fusion_importance_sampling is enabled but no teacher_model was provided. "
-                "Fusion importance sampling will be disabled."
-            )
+            if self.teacher_inference_mode == "remote":
+                logger.warning(
+                    "use_fusion_importance_sampling is enabled but the teacher is running in remote inference "
+                    "mode. The post-rollout teacher logprob computation (`_get_fused_per_token_logps`) is not "
+                    "yet supported with a remote teacher; fusion IS will be disabled. The per-token logit "
+                    "fusion during generation will still run via the remote teacher."
+                )
+            else:
+                logger.warning(
+                    "use_fusion_importance_sampling is enabled but no teacher_model was provided. "
+                    "Fusion importance sampling will be disabled."
+                )
             self.use_fusion_importance_sampling = False
 
         # Datasets
@@ -706,8 +765,14 @@ class GRPOTrainer(BaseTrainer):
         else:
             # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
             model_init_kwargs = args.model_init_kwargs or {}
-            # Special case for DeepSpeed: requires device_map=None ("auto" fails)
-            if self.args.distributed_state.distributed_type == "DEEPSPEED":
+            # See note above the student-model branch: accelerate forbids
+            # device_map='auto' under any distributed mode, but our default
+            # `create_model_from_path` falls back to 'auto'.
+            is_distributed = (
+                self.args.distributed_state.distributed_type
+                != self.args.distributed_state.distributed_type.__class__.NO
+            )
+            if is_distributed and "device_map" not in model_init_kwargs:
                 model_init_kwargs["device_map"] = None
             self.ref_model = create_model_from_path(get_config_model_id(self.model.config), **model_init_kwargs)
 
@@ -936,6 +1001,30 @@ class GRPOTrainer(BaseTrainer):
             for param in self.teacher_model.parameters():
                 param.requires_grad_(False)
 
+        # Connect to a remote teacher inference server (asymmetric TP layout).
+        # All ranks construct a client because the regular HF generate() path
+        # runs per-rank, with each rank sampling its own slice of the batch.
+        # The teacher server serializes requests internally with a global lock.
+        if self.teacher_inference_mode == "remote":
+            from ..distributed_teacher.client import RemoteTeacherClient
+
+            self.teacher_client = RemoteTeacherClient(
+                base_url=args.teacher_server_url,
+                connection_timeout=args.teacher_server_connection_timeout,
+                request_timeout=args.teacher_server_request_timeout,
+            )
+            # Validate vocab compatibility against the student tokenizer.
+            client_vocab = self.teacher_client.vocab_size
+            student_vocab = getattr(model.config, "vocab_size", None)
+            if client_vocab is not None and student_vocab is not None and client_vocab < student_vocab:
+                raise ValueError(
+                    f"Remote teacher vocab size ({client_vocab}) is smaller than the student vocab size "
+                    f"({student_vocab}). Teacher and student must share a tokenizer or the teacher must be "
+                    "a superset."
+                )
+            self._remote_teacher_pad_token_id = self.pad_token_id
+            self.accelerator.wait_for_everyone()
+
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
 
@@ -950,7 +1039,8 @@ class GRPOTrainer(BaseTrainer):
                     )
 
     def _get_logit_fusion_alpha(self) -> float | None:
-        if self.teacher_model is None or self.logit_fusion_alpha is None:
+        has_teacher = self.teacher_model is not None or self.teacher_client is not None
+        if not has_teacher or self.logit_fusion_alpha is None:
             return self.logit_fusion_alpha
         if self.logit_fusion_alpha_schedule is None:
             return self.logit_fusion_alpha
@@ -984,8 +1074,9 @@ class GRPOTrainer(BaseTrainer):
         return ((difficulty_tensor - 1.0) / 9.0).clamp(0.0, 1.0)
 
     def _in_logit_fusion_decay_phase(self) -> bool:
+        has_teacher = self.teacher_model is not None or self.teacher_client is not None
         if (
-            self.teacher_model is None
+            not has_teacher
             or self.logit_fusion_alpha is None
             or self.logit_fusion_alpha_schedule is None
             or self.state.global_step >= self.logit_fusion_alpha_decay_steps
@@ -1829,7 +1920,9 @@ class GRPOTrainer(BaseTrainer):
                 generate_inputs = self.processing_class(text=prompts, **processor_kwargs)
             generate_inputs = super()._prepare_inputs(generate_inputs)
 
-            fusion_enabled = self.teacher_model is not None and self.model.training
+            local_fusion_enabled = self.teacher_model is not None and self.model.training
+            remote_fusion_enabled = self.teacher_client is not None and self.model.training
+            fusion_enabled = local_fusion_enabled or remote_fusion_enabled
             with (
                 profiling_context(self, "transformers.generate"),
                 unwrap_model_for_generation(
@@ -1843,33 +1936,49 @@ class GRPOTrainer(BaseTrainer):
                         self.accelerator,
                         gather_deepspeed3_params=self.args.ds3_gather_for_generation,
                     )
-                    if fusion_enabled
+                    if local_fusion_enabled
                     else nullcontext(self.teacher_model)
                 ) as unwrapped_teacher,
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
                 logits_processor = None
+                _remote_processor = None  # tracked so we can reset() in finally
                 if fusion_enabled:
                     alpha = self._get_logit_fusion_alpha()
                     if alpha is not None and alpha > 0.0:
-                        logits_processor = LogitsProcessorList(
-                            [
-                                LogitsFusionProcessor(
-                                    unwrapped_teacher,
-                                    alpha,
-                                    self.pad_token_id,
-                                    "use_cache" in self.teacher_model_kwarg_keys,
-                                    alpha_scales=alpha_scales,
-                                )
-                            ]
-                        )
-                prompt_completion_ids = unwrapped_model.generate(
-                    **generate_inputs,
-                    generation_config=self.generation_config,
-                    disable_compile=True,
-                    logits_processor=logits_processor,
-                )
+                        if remote_fusion_enabled:
+                            from ..distributed_teacher.processor import RemoteLogitsFusionProcessor
+
+                            _remote_processor = RemoteLogitsFusionProcessor(
+                                client=self.teacher_client,
+                                alpha=alpha,
+                                pad_token_id=self.pad_token_id,
+                                alpha_scales=alpha_scales,
+                            )
+                            logits_processor = LogitsProcessorList([_remote_processor])
+                        else:
+                            logits_processor = LogitsProcessorList(
+                                [
+                                    LogitsFusionProcessor(
+                                        unwrapped_teacher,
+                                        alpha,
+                                        self.pad_token_id,
+                                        "use_cache" in self.teacher_model_kwarg_keys,
+                                        alpha_scales=alpha_scales,
+                                    )
+                                ]
+                            )
+                try:
+                    prompt_completion_ids = unwrapped_model.generate(
+                        **generate_inputs,
+                        generation_config=self.generation_config,
+                        disable_compile=True,
+                        logits_processor=logits_processor,
+                    )
+                finally:
+                    if _remote_processor is not None:
+                        _remote_processor.reset()
             # Compute prompt length and extract completion ids
             prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
             prompt_length = prompt_ids.size(1)

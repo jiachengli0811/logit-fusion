@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Run from the repo root regardless of where the script was invoked from, so
+# that relative paths like `examples/accelerate_configs/...` and
+# `examples/scripts/gspo.py` resolve correctly.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "${SCRIPT_DIR}")"
+cd "${REPO_ROOT}"
+
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-0.5B}"
 TEACHER_MODEL_NAME_OR_PATH="${TEACHER_MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-7B}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/logit-fusion-gspo}"
@@ -24,6 +31,16 @@ export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export TRL_MATH_VERIFY_PARSING_TIMEOUT="${TRL_MATH_VERIFY_PARSING_TIMEOUT:-30}"
 export TRL_MATH_VERIFY_VERIFY_TIMEOUT="${TRL_MATH_VERIFY_VERIFY_TIMEOUT:-30}"
+
+# Optionally restrict which physical GPUs the trainer may see, so that the
+# baseline can be benchmarked against a fixed GPU budget (e.g. a strict 1-GPU
+# baseline, or one that matches the union of student+teacher GPUs from the
+# remote layout). When unset, the trainer inherits whatever the caller's
+# CUDA_VISIBLE_DEVICES is (typically: all GPUs).
+if [[ -n "${BASELINE_GPUS:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${BASELINE_GPUS}"
+  echo "[run_logit_fusion_gspo] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (from BASELINE_GPUS)"
+fi
 
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \

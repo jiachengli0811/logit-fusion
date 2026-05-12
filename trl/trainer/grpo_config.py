@@ -398,6 +398,37 @@ class GRPOConfig(TrainingArguments):
             "help": "Number of optimizer steps over which to decay logit_fusion_alpha when a schedule is set."
         },
     )
+    teacher_inference_mode: str = field(
+        default="local",
+        metadata={
+            "help": "Where the teacher model lives during rollout. 'local' (default) co-locates the teacher with "
+            "the student on every GPU and runs it inside `transformers.generate()` via the in-process "
+            "LogitsFusionProcessor (current behavior). 'remote' assumes the teacher is being served by a "
+            "separate `trl.scripts.teacher_serve` process on a dedicated, asymmetric set of GPUs and contacted "
+            "via `teacher_server_url`. In 'remote' mode the trainer does NOT load or place the teacher model "
+            "itself; only the student GPUs carry the trainable policy."
+        },
+    )
+    teacher_server_url: str | None = field(
+        default=None,
+        metadata={
+            "help": "Base URL of the remote teacher inference server, e.g. 'http://127.0.0.1:8765'. "
+            "Required when `teacher_inference_mode='remote'`."
+        },
+    )
+    teacher_server_connection_timeout: float = field(
+        default=120.0,
+        metadata={
+            "help": "How long the trainer should wait at startup for the remote teacher inference server to "
+            "become reachable, in seconds."
+        },
+    )
+    teacher_server_request_timeout: float = field(
+        default=600.0,
+        metadata={
+            "help": "Per-request timeout (seconds) for calls to the remote teacher inference server."
+        },
+    )
     use_fusion_importance_sampling: bool = field(
         default=False,
         metadata={
